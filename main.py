@@ -1,178 +1,323 @@
-import warnings
-warnings.filterwarnings('ignore')
-
+import sys
+import os
+from pathlib import Path
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, 
+                             QPushButton, QComboBox, QLineEdit,
+                             QVBoxLayout, QHBoxLayout, QFileDialog, QStyledItemDelegate,
+                             QMessageBox)
+from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, Property
+from PySide6.QtGui import QPainter, QPainterPath, QColor, QFont
 import sounddevice as sd
-import queue
-import threading
-import numpy as np
-import time
-from VoiceConversion import ToneColorConverter
+from core import RealtimeVoiceConverter
 
-class RealtimeVoiceConverter:
-    def __init__(self, model_path, target_voice_path, device='cpu', input_device=None, output_device=None):
-        self.CHUNK = 9984
-        self.RATE = 22050
-        self.CHANNELS = 1
+class SwitchButton(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(54, 45)
+        self._is_checked = False
+        self._track_color = QColor("#E0E0E0")
+        self._thumb_color = QColor("#FFFFFF")
+        self._track_color_checked = QColor("#2196F3")  # Material Blue
+        self._thumb_position = 2
         
-        self.input_device = input_device
-        self.output_device = output_device
-        
-        self.converter = ToneColorConverter(ckpt_path=model_path, device=device)
-        
-        tgt_spec = self.converter.get_spec(fpath=target_voice_path)
-        self.target_se = self.converter.model.extract_se(tgt_spec)
-        
-        # 3개의 청크를 저장할 버퍼
-        self.chunk_buffer = []
-        self.input_queue = queue.Queue(maxsize=3)
-        self.output_queue = queue.Queue(maxsize=3)
-        
-        self.is_running = False
-        self.drop_count = 0
-        self.total_latency = 0
-        self.process_count = 0
-        
-    def start(self):
-        self.is_running = True
-        self.processor_thread = threading.Thread(target=self._process_audio)
-        self.processor_thread.start()
-        
-        def audio_callback(indata, outdata, frames, time, status):
-            if status:
-                print(status)
-            
-            # 입력 처리
-            try:
-                if not self.input_queue.full():
-                    self.input_queue.put_nowait(indata.copy().flatten())
-                else:
-                    self.drop_count += 1
-            except queue.Full:
-                pass
-            
-            # 출력 처리
-            try:
-                if not self.output_queue.empty():
-                    output_data = self.output_queue.get_nowait()
-                    output_data = output_data.astype(np.float32) * 0.8
-                    outdata[:] = output_data.reshape(-1, 1)
-                else:
-                    outdata.fill(0)
-            except queue.Empty:
-                outdata.fill(0)
-        
-        self.stream = sd.Stream(
-            channels=self.CHANNELS,
-            samplerate=self.RATE,
-            blocksize=self.CHUNK,
-            dtype=np.float32,
-            callback=audio_callback,
-            device=(self.input_device, self.output_device),
-            latency='high'
-        )
-        self.stream.start()
-    
-    def _process_audio(self):
-        while self.is_running:
-            try:
-                # 새로운 청크를 가져옴
-                audio_chunk = self.input_queue.get(timeout=0.1)
-                
-                # 버퍼에 청크 추가
-                self.chunk_buffer.append(audio_chunk)
-                
-                # 3개의 청크가 모이면 처리 시작
-                if len(self.chunk_buffer) == 3:
-                    start_time = time.time()
-                    
-                    # 3개의 청크를 연결
-                    combined_audio = np.concatenate(self.chunk_buffer)
-                    
-                    # 전체 오디오에 대해 변환 수행
-                    src_spec = self.converter.get_spec(wav=combined_audio)
-                    converted_audio, _ = self.converter.convert(src_spec, self.target_se)
-                    
-                    # 변환된 오디오 처리
-                    converted_audio = np.nan_to_num(converted_audio)
-                    converted_audio = np.clip(converted_audio, -1.0, 1.0)
-                    
-                    # 중간 청크만 추출 (전체 길이를 3으로 나누어 중간 부분 선택)
-                    chunk_length = len(converted_audio) // 3
-                    middle_chunk = converted_audio[chunk_length:2*chunk_length]
-                    
-                    # 페이드 인/아웃 적용
-                    fade_len = min(512, len(middle_chunk) // 4)
-                    fade_in = np.linspace(0, 1, fade_len)
-                    fade_out = np.linspace(1, 0, fade_len)
-                    
-                    middle_chunk[:fade_len] *= fade_in
-                    middle_chunk[-fade_len:] *= fade_out
-                    
-                    # 출력 큐에 중간 청크만 전송
-                    self.output_queue.put_nowait(middle_chunk)
-                    
-                    # 첫 번째 청크를 버리고 나머지는 유지
-                    self.chunk_buffer = self.chunk_buffer[1:]
-                    
-                    process_time = time.time() - start_time
-                    self.total_latency += process_time
-                    self.process_count += 1
-                
-            except queue.Empty:
-                continue
-    
-    def stop(self):
-        self.is_running = False
-        if hasattr(self, 'stream'):
-            self.stream.stop()
-            self.stream.close()
-        if hasattr(self, 'processor_thread'):
-            self.processor_thread.join()
-    
-    def get_stats(self):
-        if self.process_count == 0:
-            avg_latency = 0
+        # Setup animation
+        self.animation = QPropertyAnimation(self, b"position", self)
+        self.animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self.animation.setDuration(200)
+
+    def get_position(self):
+        return self._thumb_position
+
+    def set_position(self, pos):
+        self._thumb_position = pos
+        self.update()
+
+    position = Property(float, get_position, set_position)
+
+    def mousePressEvent(self, event):
+        self._is_checked = not self._is_checked
+        self.animation.setStartValue(self._thumb_position)
+        if self._is_checked:
+            self.animation.setEndValue(27)
         else:
-            avg_latency = (self.total_latency / self.process_count) * 1000
+            self.animation.setEndValue(2)
+        self.animation.start()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Draw track
+        track_opacity = 0.6 if not self._is_checked else 1.0
+        painter.setOpacity(track_opacity)
+        track_color = self._track_color if not self._is_checked else self._track_color_checked
+        painter.setBrush(track_color)
+        painter.setPen(Qt.NoPen)
+        track_path = QPainterPath()
+        track_path.addRoundedRect(0, 8, 54, 18, 9, 9)
+        painter.drawPath(track_path)
+
+        # Draw ON/OFF text
+        painter.setOpacity(1.0)
+        painter.setPen(QColor("#FFFFFF"))
+        font = QFont()
+        font.setPointSize(7)
+        font.setBold(True)
+        painter.setFont(font)
+        if self._is_checked:
+            painter.drawText(7, 20, "ON")
+        else:
+            painter.drawText(30, 20, "OFF")
+
+        # Draw thumb
+        painter.setOpacity(1.0)
+        painter.setBrush(self._thumb_color)
+        shadow = QColor(0, 0, 0, 30)
+        painter.setPen(shadow)
+        thumb_path = QPainterPath()
+        thumb_path.addEllipse(self._thumb_position, 4, 26, 26)
+        painter.drawPath(thumb_path)
+
+class ComboBoxItemDelegate(QStyledItemDelegate):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._check_icon = "✓"  # 체크 표시 문자
+
+    def paint(self, painter, option, index):
+        # 기본 아이템 그리기
+        super().paint(painter, option, index)
         
-        return {
-            'dropped_frames': self.drop_count,
-            'average_latency': f"{avg_latency:.1f}ms",
-            'input_queue_size': self.input_queue.qsize(),
-            'output_queue_size': self.output_queue.qsize(),
-            'processed_chunks': self.process_count,
-            'buffer_size': len(self.chunk_buffer)
-        }
+        # 현재 선택된 아이템인 경우 체크 표시 추가
+        if index.row() == index.model().parent().currentIndex():
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing)
+            
+            # 폰트 설정
+            font = painter.font()
+            font.setPointSize(10)
+            painter.setFont(font)
+            
+            # 체크 표시 색상 설정 (파란색)
+            painter.setPen(QColor("#2196F3"))
+            
+            # 체크 표시 위치 계산 (오른쪽 정렬)
+            check_width = painter.fontMetrics().horizontalAdvance(self._check_icon)
+            x = option.rect.right() - check_width - 10  # 오른쪽 여백
+            y = option.rect.center().y() + painter.fontMetrics().height() / 3
+            
+            # 체크 표시 그리기
+            painter.drawText(x, y, self._check_icon)
+            painter.restore()
 
-def main():
-    print("\nAvailable audio devices:")
-    print(sd.query_devices())
-    
-    input_device = -1  # int(input("\nEnter input device index (-1 for default): "))
-    output_device = -1  # int(input("Enter output device index (-1 for default): "))
-    
-    input_device = None if input_device == -1 else input_device
-    output_device = None if output_device == -1 else output_device
-    
-    converter = RealtimeVoiceConverter(
-        model_path='VoiceConversion/model.pth',
-        target_voice_path='samples/tsu.wav',
-        device='cpu',
-        input_device=input_device,
-        output_device=output_device
-    )
-    
-    print("\nStarting voice conversion... Press Ctrl+C to stop")
-    converter.start()
-    
-    try:
-        while True:
-            time.sleep(1)
-            stats = converter.get_stats()
-            print(f"Status: {stats}")
-    except KeyboardInterrupt:
-        print("\nStopping voice conversion...")
-        converter.stop()
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Voice Conversion")
+        self.setFixedSize(500, 400)
+        
+        self.setStyleSheet("background-color: white;")
+        self.converter = None  # Voice converter 인스턴스 저장용
+        
+        self._setup_ui()
+        self._setup_styles()
+        self._setup_connections()
 
-if __name__ == "__main__":
-    main()
+    def _setup_ui(self):
+        # Create central widget and main layout
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(20)
+
+        # Voice Header (Label and Switch)
+        voice_header = QHBoxLayout()
+        self.voice_label = QLabel("Voice")
+        self.switch = SwitchButton()
+        voice_header.addWidget(self.voice_label)
+        voice_header.addStretch()
+        voice_header.addWidget(self.switch)
+        main_layout.addLayout(voice_header)
+
+        # File Selection
+        file_layout = QHBoxLayout()
+        self.file_path = QLineEdit()
+        self.file_path.setPlaceholderText("Select audio file...")
+        self.file_path.setReadOnly(True)
+        self.select_button = QPushButton("Select\nVoice")
+        self.select_button.setFixedWidth(60)
+        self.select_button.setFixedHeight(50)
+        file_layout.addWidget(self.file_path)
+        file_layout.addWidget(self.select_button)
+        main_layout.addLayout(file_layout)
+
+        # Device Selection with Labels
+        # Input Device
+        input_layout = QVBoxLayout()
+        input_layout.setSpacing(4)
+        input_label = QLabel("Select Input Device")
+        self.input_combo = QComboBox()
+        
+        # 커스텀 델리게이트 설정
+        self.input_combo.setItemDelegate(ComboBoxItemDelegate(self.input_combo))
+        
+        # Get input devices
+        input_devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        input_device_names = []
+        self.input_device_ids = []  # Store device IDs
+        default_input_idx = 0  # Default index to select
+        
+        for i, device in enumerate(input_devices):
+            if device['max_input_channels'] > 0:  # Input device
+                # Get hostapi name
+                hostapi_name = hostapis[device['hostapi']]['name']
+                name = f"{device['name']} ({hostapi_name})"
+                input_device_names.append(name)
+                self.input_device_ids.append(i)
+                if i == sd.default.device[0]:  # Check if this is the default input device
+                    default_input_idx = len(input_device_names) - 1
+
+        self.input_combo.addItems(input_device_names)
+        self.input_combo.setCurrentIndex(default_input_idx)
+        self.input_combo.view().setSpacing(0)
+        self.input_combo.view().setContentsMargins(0, 0, 0, 0)
+        input_layout.addWidget(input_label)
+        input_layout.addWidget(self.input_combo)
+        main_layout.addLayout(input_layout)
+
+        # Output Device
+        output_layout = QVBoxLayout()
+        output_layout.setSpacing(4)
+        output_label = QLabel("Select Output Device")
+        self.output_combo = QComboBox()
+        
+        # 커스텀 델리게이트 설정
+        self.output_combo.setItemDelegate(ComboBoxItemDelegate(self.output_combo))
+        
+        # Get output devices
+        output_device_names = []
+        self.output_device_ids = []  # Store device IDs
+        default_output_idx = 0  # Default index to select
+        
+        for i, device in enumerate(input_devices):
+            if device['max_output_channels'] > 0:  # Output device
+                # Get hostapi name
+                hostapi_name = hostapis[device['hostapi']]['name']
+                name = f"{device['name']} ({hostapi_name})"
+                output_device_names.append(name)
+                self.output_device_ids.append(i)
+                if i == sd.default.device[1]:  # Check if this is the default output device
+                    default_output_idx = len(output_device_names) - 1
+
+        self.output_combo.addItems(output_device_names)
+        self.output_combo.setCurrentIndex(default_output_idx)
+        self.output_combo.view().setSpacing(0)
+        self.output_combo.view().setContentsMargins(0, 0, 0, 0)
+        output_layout.addWidget(output_label)
+        output_layout.addWidget(self.output_combo)
+        main_layout.addLayout(output_layout)
+
+        main_layout.addStretch()
+
+    def _setup_connections(self):
+        self.select_button.clicked.connect(self.select_audio_file)
+        self.switch.mousePressEvent = self.handle_switch_click  # 스위치 이벤트 오버라이드
+
+    def handle_switch_click(self, event):
+        if not self.file_path.text():
+            QMessageBox.warning(self, "Warning", "Please select a voice file first.")
+            return
+            
+        # 기존 스위치 동작 수행
+        self.switch._is_checked = not self.switch._is_checked
+        self.switch.animation.setStartValue(self.switch._thumb_position)
+        
+        if self.switch._is_checked:
+            self.switch.animation.setEndValue(27)
+            self.start_voice_conversion()
+        else:
+            self.switch.animation.setEndValue(2)
+            self.stop_voice_conversion()
+            
+        self.switch.animation.start()
+
+    def start_voice_conversion(self):
+        try:
+            # 현재 선택된 디바이스 인덱스 가져오기
+            input_idx = self.input_device_ids[self.input_combo.currentIndex()]
+            output_idx = self.output_device_ids[self.output_combo.currentIndex()]
+            
+            # Voice Converter 인스턴스 생성
+            self.converter = RealtimeVoiceConverter(
+                model_path='vc/model.pth',  # 모델 경로 설정
+                target_voice_path=self.file_path.text(),  # 선택된 음성 파일 경로
+                device='cpu',  # 또는 'cuda' if GPU 사용 시
+                input_device=input_idx,
+                output_device=output_idx
+            )
+            
+            # 변환 시작
+            self.converter.start()
+            
+            # UI 컴포넌트 비활성화
+            self.input_combo.setEnabled(False)
+            self.output_combo.setEnabled(False)
+            self.select_button.setEnabled(False)
+            self.file_path.setEnabled(False)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to start voice conversion: {str(e)}")
+            self.switch._is_checked = False
+            self.switch.animation.setStartValue(self.switch._thumb_position)
+            self.switch.animation.setEndValue(2)
+            self.switch.animation.start()
+
+    def stop_voice_conversion(self):
+        try:
+            if self.converter:
+                self.converter.stop()
+                self.converter = None
+            
+            # UI 컴포넌트 활성화
+            self.input_combo.setEnabled(True)
+            self.output_combo.setEnabled(True)
+            self.select_button.setEnabled(True)
+            self.file_path.setEnabled(True)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to stop voice conversion: {str(e)}")
+
+    def select_audio_file(self):
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Audio File",
+            "",
+            "Audio Files (*.wav *.mp3)"
+        )
+        
+        if file_name:
+            # 절대 경로로 표시
+            self.file_path.setText(str(Path(file_name).absolute()))
+
+    def closeEvent(self, event):
+        # 프로그램 종료 시 voice converter 정리
+        if self.converter:
+            self.stop_voice_conversion()
+        event.accept()
+
+    def _setup_styles(self):
+        self.setStyleSheet(open('stylesheet.qss', 'r', encoding='utf-8').read())
+
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    
+    # 어플리케이션 레벨에서 기본 색상 팔레트 설정
+    app.setPalette(app.style().standardPalette())
+    
+    window = MainWindow()
+    window.show()
+    
+    sys.exit(app.exec())
