@@ -13,7 +13,7 @@ class RealtimeVoiceConverter:
         self.CHUNK = 9984
         self.RATE = 22050
         self.CHANNELS = 1
-        self.CROSSFADE_SIZE = int(self.RATE * 0.015)
+        self.CROSSFADE_SIZE = int(self.RATE * 0.005)
         self.SPEECH_THRESHOLD = 0.015
 
         self.SILENCE_CHUNK = np.zeros(self.CHUNK, dtype=np.float32)
