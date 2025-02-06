@@ -86,7 +86,7 @@ class RealtimeVoiceConverter:
                         middle_chunk = self.SILENCE_CHUNK
                     
                     middle_chunk = self.apply_short_crossfade(middle_chunk)
-                    self.output_queue.put_nowait(middle_chunk)
+                    self.output_queue.put(middle_chunk)
                     
                     self.last_was_speech = middle_chunk_speech
                     self.chunk_buffer.pop(0)
@@ -99,7 +99,7 @@ class RealtimeVoiceConverter:
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"Error in processing: {e}")
+                print(f"Error in processing: \"{e}\"")
                 continue
 
     def start(self):
