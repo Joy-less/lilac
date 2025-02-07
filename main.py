@@ -252,7 +252,7 @@ class MainWindow(QMainWindow):
             self.converter = RealtimeVoiceConverter(
                 model_path='vc/model.pth',  # 모델 경로 설정
                 target_voice_path=self.file_path.text(),  # 선택된 음성 파일 경로
-                device='cpu',  # 또는 'cuda' if GPU 사용 시
+                device='cuda' if torch.cuda.is_available() else 'cpu',
                 input_device=input_idx,
                 output_device=output_idx
             )
